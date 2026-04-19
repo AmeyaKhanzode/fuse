@@ -29,14 +29,30 @@ import (
 // "config.txt" creates ".wh.config.txt" in the upper layer.
 const whPrefix = ".wh."
 
-// unionFS owns the two underlying branches. It is shared by every node.
+// unionFS owns the underlying branches. It is shared by every node.
+//
+// lowerDirs is ordered by decreasing priority: lowerDirs[0] is the topmost
+// lower layer (checked first after upper), lowerDirs[len-1] is the deepest
+// base. upperDir is always the sole read-write layer and wins over every
+// lower.
 type unionFS struct {
-	lowerDir string
-	upperDir string
+	lowerDirs []string
+	upperDir  string
 }
 
 func (u *unionFS) upperPath(rel string) string { return filepath.Join(u.upperDir, rel) }
-func (u *unionFS) lowerPath(rel string) string { return filepath.Join(u.lowerDir, rel) }
+
+// findInLowers walks the lower stack top-to-bottom and returns the first
+// layer path that contains rel. (path, true) on hit; ("", false) otherwise.
+func (u *unionFS) findInLowers(rel string) (string, bool) {
+	for _, d := range u.lowerDirs {
+		p := filepath.Join(d, rel)
+		if _, err := os.Lstat(p); err == nil {
+			return p, true
+		}
+	}
+	return "", false
+}
 
 // whPathFor returns the whiteout path that would shadow rel in the upper dir.
 func (u *unionFS) whPathFor(rel string) string {
@@ -54,7 +70,8 @@ func (u *unionFS) isWhiteouted(rel string) bool {
 }
 
 // resolve picks the effective physical path for rel: upper wins unless
-// whiteouted; otherwise fall back to lower. Returns (path, inUpper, err).
+// whiteouted; otherwise fall back to the first lower that has it.
+// Returns (path, inUpper, err).
 func (u *unionFS) resolve(rel string) (string, bool, error) {
 	if u.isWhiteouted(rel) {
 		return "", false, syscall.ENOENT
@@ -63,22 +80,24 @@ func (u *unionFS) resolve(rel string) (string, bool, error) {
 	if _, err := os.Lstat(up); err == nil {
 		return up, true, nil
 	}
-	lp := u.lowerPath(rel)
-	if _, err := os.Lstat(lp); err == nil {
+	if lp, ok := u.findInLowers(rel); ok {
 		return lp, false, nil
 	}
 	return "", false, syscall.ENOENT
 }
 
-// copyUp performs Copy-on-Write: copies rel from the lower branch into the
-// upper branch, creating parent directories as needed. No-op if already
-// present in upper.
+// copyUp performs Copy-on-Write: finds rel in the first lower that has it
+// and copies it into the upper branch, creating parent directories as
+// needed. No-op if already present in upper.
 func (u *unionFS) copyUp(rel string) error {
 	up := u.upperPath(rel)
 	if _, err := os.Lstat(up); err == nil {
 		return nil
 	}
-	lp := u.lowerPath(rel)
+	lp, ok := u.findInLowers(rel)
+	if !ok {
+		return syscall.ENOENT
+	}
 	srcInfo, err := os.Stat(lp)
 	if err != nil {
 		return err
@@ -222,8 +241,13 @@ func (n *unionNode) Readdir(ctx context.Context) (fs.DirStream, syscall.Errno) {
 			})
 		}
 	}
-	// Lower fills in anything the upper layer neither replaced nor masked.
-	if lp, err := os.ReadDir(n.ufs.lowerPath(n.path)); err == nil {
+	// Each lower, top-down, fills in anything not already contributed or
+	// masked. Higher-priority lowers win over deeper ones on name collisions.
+	for _, ld := range n.ufs.lowerDirs {
+		lp, err := os.ReadDir(filepath.Join(ld, n.path))
+		if err != nil {
+			continue
+		}
 		for _, e := range lp {
 			name := e.Name()
 			if whited[name] || seen[name] {
@@ -307,10 +331,9 @@ func (n *unionNode) Unlink(ctx context.Context, name string) syscall.Errno {
 		return syscall.ENOENT
 	}
 	upperP := n.ufs.upperPath(childPath)
-	lowerP := n.ufs.lowerPath(childPath)
 	_, upErr := os.Lstat(upperP)
-	_, loErr := os.Lstat(lowerP)
-	if upErr != nil && loErr != nil {
+	_, inLower := n.ufs.findInLowers(childPath)
+	if upErr != nil && !inLower {
 		return syscall.ENOENT
 	}
 	if upErr == nil {
@@ -318,8 +341,8 @@ func (n *unionNode) Unlink(ctx context.Context, name string) syscall.Errno {
 			return fs.ToErrno(err)
 		}
 	}
-	// Lower is immutable, so we shadow it with a whiteout marker instead.
-	if loErr == nil {
+	// Lowers are immutable, so we shadow them with a whiteout marker instead.
+	if inLower {
 		if err := writeWhiteout(n.ufs.whPathFor(childPath)); err != nil {
 			return fs.ToErrno(err)
 		}
@@ -361,14 +384,13 @@ func (n *unionNode) Rmdir(ctx context.Context, name string) syscall.Errno {
 		return syscall.ENOENT
 	}
 	upperP := n.ufs.upperPath(childPath)
-	lowerP := n.ufs.lowerPath(childPath)
 	_, upErr := os.Lstat(upperP)
-	_, loErr := os.Lstat(lowerP)
-	if upErr != nil && loErr != nil {
+	_, inLower := n.ufs.findInLowers(childPath)
+	if upErr != nil && !inLower {
 		return syscall.ENOENT
 	}
 	// Merged-view emptiness check: the directory may inherit entries from
-	// lower that aren't physically in upper.
+	// any lower layer that aren't physically in upper.
 	if !n.dirEmptyMerged(childPath) {
 		return syscall.ENOTEMPTY
 	}
@@ -377,7 +399,7 @@ func (n *unionNode) Rmdir(ctx context.Context, name string) syscall.Errno {
 			return fs.ToErrno(err)
 		}
 	}
-	if loErr == nil {
+	if inLower {
 		if err := writeWhiteout(n.ufs.whPathFor(childPath)); err != nil {
 			return fs.ToErrno(err)
 		}
@@ -403,7 +425,11 @@ func (n *unionNode) dirEmptyMerged(rel string) bool {
 	if len(seen) > 0 {
 		return false
 	}
-	if lp, err := os.ReadDir(n.ufs.lowerPath(rel)); err == nil {
+	for _, ld := range n.ufs.lowerDirs {
+		lp, err := os.ReadDir(filepath.Join(ld, rel))
+		if err != nil {
+			continue
+		}
 		for _, e := range lp {
 			name := e.Name()
 			if whited[name] || strings.HasPrefix(name, whPrefix) {
@@ -509,7 +535,10 @@ func (f *unionFile) Getattr(ctx context.Context, out *fuse.AttrOut) syscall.Errn
 func main() {
 	debug := flag.Bool("debug", false, "enable FUSE debug logging")
 	flag.Usage = func() {
-		fmt.Fprintf(os.Stderr, "Usage: %s [flags] <lower_dir> <upper_dir> <mount_dir>\n", os.Args[0])
+		fmt.Fprintf(os.Stderr, "Usage: %s [flags] <lower_dirs> <upper_dir> <mount_dir>\n", os.Args[0])
+		fmt.Fprintf(os.Stderr, "  <lower_dirs>  one or more read-only layers, colon-separated.\n")
+		fmt.Fprintf(os.Stderr, "                Leftmost = highest priority, rightmost = deepest base.\n")
+		fmt.Fprintf(os.Stderr, "                Example: base:midlayer:topmost\n")
 		flag.PrintDefaults()
 	}
 	flag.Parse()
@@ -517,10 +546,23 @@ func main() {
 		flag.Usage()
 		os.Exit(2)
 	}
-	lowerDir, err := filepath.Abs(flag.Arg(0))
-	if err != nil {
-		log.Fatalf("lower_dir: %v", err)
+
+	rawLowers := strings.Split(flag.Arg(0), ":")
+	lowerDirs := make([]string, 0, len(rawLowers))
+	for _, d := range rawLowers {
+		if d == "" {
+			log.Fatalf("empty entry in <lower_dirs>")
+		}
+		abs, err := filepath.Abs(d)
+		if err != nil {
+			log.Fatalf("lower_dir %q: %v", d, err)
+		}
+		lowerDirs = append(lowerDirs, abs)
 	}
+	if len(lowerDirs) == 0 {
+		log.Fatal("at least one lower_dir required")
+	}
+
 	upperDir, err := filepath.Abs(flag.Arg(1))
 	if err != nil {
 		log.Fatalf("upper_dir: %v", err)
@@ -529,7 +571,7 @@ func main() {
 	if err != nil {
 		log.Fatalf("mount_dir: %v", err)
 	}
-	for _, d := range []string{lowerDir, upperDir, mountDir} {
+	for _, d := range append(append([]string{}, lowerDirs...), upperDir, mountDir) {
 		st, err := os.Stat(d)
 		if err != nil {
 			log.Fatalf("cannot stat %s: %v", d, err)
@@ -539,7 +581,7 @@ func main() {
 		}
 	}
 
-	ufs := &unionFS{lowerDir: lowerDir, upperDir: upperDir}
+	ufs := &unionFS{lowerDirs: lowerDirs, upperDir: upperDir}
 	root := &unionNode{ufs: ufs, path: ""}
 
 	opts := &fs.Options{
@@ -556,7 +598,7 @@ func main() {
 	if err != nil {
 		log.Fatalf("mount failed: %v", err)
 	}
-	log.Printf("mini_unionfs mounted: lower=%s upper=%s mnt=%s", lowerDir, upperDir, mountDir)
+	log.Printf("mini_unionfs mounted: lowers=%v upper=%s mnt=%s", lowerDirs, upperDir, mountDir)
 
 	// Clean unmount on SIGINT/SIGTERM so the test harness doesn't leave a
 	// stale mount behind.

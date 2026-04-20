@@ -1,10 +1,3 @@
-// Mini-UnionFS: a simple userspace union filesystem using FUSE.
-//
-// Usage: mini_unionfs <lower_dir> <upper_dir> <mount_dir>
-//
-//   lower_dir : read-only base layer
-//   upper_dir : read-write top layer (receives CoW copies and whiteouts)
-//   mount_dir : where the merged view is mounted
 package main
 
 import (
@@ -25,16 +18,8 @@ import (
 	"github.com/hanwen/go-fuse/v2/fuse"
 )
 
-// whPrefix marks deletions of lower-layer entries. Example: deleting
-// "config.txt" creates ".wh.config.txt" in the upper layer.
 const whPrefix = ".wh."
 
-// unionFS owns the underlying branches. It is shared by every node.
-//
-// lowerDirs is ordered by decreasing priority: lowerDirs[0] is the topmost
-// lower layer (checked first after upper), lowerDirs[len-1] is the deepest
-// base. upperDir is always the sole read-write layer and wins over every
-// lower.
 type unionFS struct {
 	lowerDirs []string
 	upperDir  string
@@ -42,8 +27,6 @@ type unionFS struct {
 
 func (u *unionFS) upperPath(rel string) string { return filepath.Join(u.upperDir, rel) }
 
-// findInLowers walks the lower stack top-to-bottom and returns the first
-// layer path that contains rel. (path, true) on hit; ("", false) otherwise.
 func (u *unionFS) findInLowers(rel string) (string, bool) {
 	for _, d := range u.lowerDirs {
 		p := filepath.Join(d, rel)
@@ -54,13 +37,11 @@ func (u *unionFS) findInLowers(rel string) (string, bool) {
 	return "", false
 }
 
-// whPathFor returns the whiteout path that would shadow rel in the upper dir.
 func (u *unionFS) whPathFor(rel string) string {
 	dir, base := filepath.Split(rel)
 	return filepath.Join(u.upperDir, dir, whPrefix+base)
 }
 
-// isWhiteouted reports whether rel has been marked deleted in upper.
 func (u *unionFS) isWhiteouted(rel string) bool {
 	if rel == "" || rel == "/" {
 		return false
@@ -69,9 +50,6 @@ func (u *unionFS) isWhiteouted(rel string) bool {
 	return err == nil
 }
 
-// resolve picks the effective physical path for rel: upper wins unless
-// whiteouted; otherwise fall back to the first lower that has it.
-// Returns (path, inUpper, err).
 func (u *unionFS) resolve(rel string) (string, bool, error) {
 	if u.isWhiteouted(rel) {
 		return "", false, syscall.ENOENT
@@ -86,9 +64,6 @@ func (u *unionFS) resolve(rel string) (string, bool, error) {
 	return "", false, syscall.ENOENT
 }
 
-// copyUp performs Copy-on-Write: finds rel in the first lower that has it
-// and copies it into the upper branch, creating parent directories as
-// needed. No-op if already present in upper.
 func (u *unionFS) copyUp(rel string) error {
 	up := u.upperPath(rel)
 	if _, err := os.Lstat(up); err == nil {
@@ -121,9 +96,6 @@ func (u *unionFS) copyUp(rel string) error {
 	return nil
 }
 
-// stableIno derives a deterministic inode number from a virtual path so that
-// repeated Lookups return the same StableAttr even when the file migrates
-// between lower and upper (e.g. after CoW).
 func stableIno(path string) uint64 {
 	h := fnv.New64a()
 	h.Write([]byte(path))
@@ -134,9 +106,6 @@ func stableIno(path string) uint64 {
 	return n
 }
 
-// unionNode is the InodeEmbedder for every file and directory in the union.
-// It stores the virtual path (relative to the mount root) so each op can
-// re-resolve against lower/upper without walking the inode tree.
 type unionNode struct {
 	fs.Inode
 	ufs  *unionFS
@@ -150,8 +119,6 @@ func (n *unionNode) child(name string) string {
 	return filepath.Join(n.path, name)
 }
 
-// Compile-time interface assertions — fail fast if the FUSE surface we
-// think we implement drifts.
 var (
 	_ fs.NodeGetattrer = (*unionNode)(nil)
 	_ fs.NodeLookuper  = (*unionNode)(nil)
@@ -164,7 +131,6 @@ var (
 )
 
 func (n *unionNode) Getattr(ctx context.Context, fh fs.FileHandle, out *fuse.AttrOut) syscall.Errno {
-	// If a live fd is attached, fstat it — cheaper and avoids TOCTOU.
 	if f, ok := fh.(*unionFile); ok && f != nil {
 		var st syscall.Stat_t
 		if err := syscall.Fstat(f.fd, &st); err != nil {
@@ -175,7 +141,6 @@ func (n *unionNode) Getattr(ctx context.Context, fh fs.FileHandle, out *fuse.Att
 	}
 	path, _, err := n.ufs.resolve(n.path)
 	if err != nil {
-		// The mount root must always have attrs; fall back to upper itself.
 		if n.path == "" {
 			path = n.ufs.upperDir
 		} else {
@@ -191,7 +156,7 @@ func (n *unionNode) Getattr(ctx context.Context, fh fs.FileHandle, out *fuse.Att
 }
 
 func (n *unionNode) Lookup(ctx context.Context, name string, out *fuse.EntryOut) (*fs.Inode, syscall.Errno) {
-	// Whiteouts are internal bookkeeping — never expose them.
+	// whiteout
 	if strings.HasPrefix(name, whPrefix) {
 		return nil, syscall.ENOENT
 	}
@@ -218,7 +183,6 @@ func (n *unionNode) Readdir(ctx context.Context) (fs.DirStream, syscall.Errno) {
 	whited := map[string]bool{}
 	var entries []fuse.DirEntry
 
-	// Upper first so it wins on name collisions; also collects whiteouts.
 	if up, err := os.ReadDir(n.ufs.upperPath(n.path)); err == nil {
 		for _, e := range up {
 			name := e.Name()
@@ -241,8 +205,6 @@ func (n *unionNode) Readdir(ctx context.Context) (fs.DirStream, syscall.Errno) {
 			})
 		}
 	}
-	// Each lower, top-down, fills in anything not already contributed or
-	// masked. Higher-priority lowers win over deeper ones on name collisions.
 	for _, ld := range n.ufs.lowerDirs {
 		lp, err := os.ReadDir(filepath.Join(ld, n.path))
 		if err != nil {
@@ -278,7 +240,7 @@ func (n *unionNode) Open(ctx context.Context, flags uint32) (fs.FileHandle, uint
 	}
 	accMode := flags & uint32(syscall.O_ACCMODE)
 	wantWrite := accMode == syscall.O_WRONLY || accMode == syscall.O_RDWR
-	// CoW: first write against a lower-only file materialises it in upper.
+	// copy on write
 	if wantWrite && !inUpper {
 		if err := n.ufs.copyUp(n.path); err != nil {
 			return nil, 0, fs.ToErrno(err)
@@ -298,7 +260,6 @@ func (n *unionNode) Create(ctx context.Context, name string, flags uint32, mode 
 	}
 	childPath := n.child(name)
 	upperPath := n.ufs.upperPath(childPath)
-	// Resurrecting a previously-deleted lower entry: drop the whiteout.
 	_ = os.Remove(n.ufs.whPathFor(childPath))
 	if err := os.MkdirAll(filepath.Dir(upperPath), 0o755); err != nil {
 		return nil, nil, 0, fs.ToErrno(err)
@@ -341,7 +302,6 @@ func (n *unionNode) Unlink(ctx context.Context, name string) syscall.Errno {
 			return fs.ToErrno(err)
 		}
 	}
-	// Lowers are immutable, so we shadow them with a whiteout marker instead.
 	if inLower {
 		if err := writeWhiteout(n.ufs.whPathFor(childPath)); err != nil {
 			return fs.ToErrno(err)
@@ -389,13 +349,11 @@ func (n *unionNode) Rmdir(ctx context.Context, name string) syscall.Errno {
 	if upErr != nil && !inLower {
 		return syscall.ENOENT
 	}
-	// Merged-view emptiness check: the directory may inherit entries from
-	// any lower layer that aren't physically in upper.
 	if !n.dirEmptyMerged(childPath) {
 		return syscall.ENOTEMPTY
 	}
 	if upErr == nil {
-		if err := os.Remove(upperP); err != nil {
+		if err := os.RemoveAll(upperP); err != nil {
 			return fs.ToErrno(err)
 		}
 	}
@@ -407,8 +365,6 @@ func (n *unionNode) Rmdir(ctx context.Context, name string) syscall.Errno {
 	return 0
 }
 
-// dirEmptyMerged returns true if the merged view of rel has no visible
-// children (lower entries are hidden by whiteouts in upper).
 func (n *unionNode) dirEmptyMerged(rel string) bool {
 	whited := map[string]bool{}
 	seen := map[string]bool{}
@@ -441,7 +397,6 @@ func (n *unionNode) dirEmptyMerged(rel string) bool {
 	return true
 }
 
-// writeWhiteout creates the zero-byte marker file used to mask a lower entry.
 func writeWhiteout(path string) error {
 	if err := os.MkdirAll(filepath.Dir(path), 0o755); err != nil {
 		return err
@@ -453,8 +408,6 @@ func writeWhiteout(path string) error {
 	return f.Close()
 }
 
-// unionFile is the per-open file handle. It owns an fd into the *resolved*
-// file (always in upper for write paths thanks to Open's CoW logic).
 type unionFile struct {
 	mu sync.Mutex
 	fd int
@@ -501,7 +454,6 @@ func (f *unionFile) Release(ctx context.Context) syscall.Errno {
 func (f *unionFile) Flush(ctx context.Context) syscall.Errno {
 	f.mu.Lock()
 	defer f.mu.Unlock()
-	// dup+close so buffered data reaches the kernel without closing our fd.
 	newFd, err := syscall.Dup(f.fd)
 	if err != nil {
 		return fs.ToErrno(err)
@@ -600,8 +552,6 @@ func main() {
 	}
 	log.Printf("mini_unionfs mounted: lowers=%v upper=%s mnt=%s", lowerDirs, upperDir, mountDir)
 
-	// Clean unmount on SIGINT/SIGTERM so the test harness doesn't leave a
-	// stale mount behind.
 	sigCh := make(chan os.Signal, 1)
 	signal.Notify(sigCh, syscall.SIGINT, syscall.SIGTERM)
 	go func() {
